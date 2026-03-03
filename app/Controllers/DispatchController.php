@@ -22,12 +22,17 @@ class DispatchController extends Controller
         $tags = $tagModel->allWithCountForUser($this->userId());
         $messages = $messageModel->allForUser($this->userId());
 
+        // Check if user has Evolution API configured
+        $userModel = new User();
+        $credentials = $userModel->getEvolutionCredentials($this->userId());
+
         $flash = $this->getFlash();
 
         $this->view('dispatch.queue', [
             'tags' => $tags,
             'messages' => $messages,
             'flash' => $flash,
+            'evolutionConfigured' => $credentials !== null && $credentials['connection_status'] === 'active',
         ]);
     }
 
@@ -92,6 +97,7 @@ class DispatchController extends Controller
 
     /**
      * Send a single message (AJAX endpoint, called sequentially by JS)
+     * Uses PER-USER dynamic Evolution API credentials.
      */
     public function send(): void
     {
@@ -102,7 +108,6 @@ class DispatchController extends Controller
         $template = $this->input('template', '');
         $aiEnabled = (bool) $this->input('ai_enabled', false);
         $aiPrompt = $this->input('ai_prompt', '');
-        $instance = $this->input('instance', '');
         $dryRun = (bool) $this->input('dry_run', false);
 
         // Get contact
@@ -155,14 +160,13 @@ class DispatchController extends Controller
             return;
         }
 
-        // Get Evolution API instance
-        if (empty($instance)) {
-            $userModel = new User();
-            $user = $userModel->findById($this->userId());
-            $instance = $user['evolution_instance'] ?? '';
-        }
+        // =====================================================
+        // DYNAMIC CREDENTIALS: fetch per-user Evolution config
+        // =====================================================
+        $userModel = new User();
+        $credentials = $userModel->getEvolutionCredentials($this->userId());
 
-        if (empty($instance) || empty(CONFIG['evolution']['url'])) {
+        if (!$credentials || empty($credentials['base_url']) || empty($credentials['instance_name']) || empty($credentials['token'])) {
             $logId = $dispatchLog->logDispatch(
                 $this->userId(),
                 $contactId,
@@ -170,41 +174,19 @@ class DispatchController extends Controller
                 $template,
                 $finalMessage,
                 'failed',
-                'Evolution API não configurada'
+                'Evolution API não configurada. Vá em Configurações para configurar.'
             );
 
             $this->json([
                 'success' => false,
-                'error' => 'Evolution API não configurada. Vá em Configurações para configurar.',
+                'error' => 'Evolution API não configurada. Vá em Configurações → WhatsApp para configurar suas credenciais.',
                 'message' => $finalMessage,
                 'log_id' => $logId,
             ]);
             return;
         }
 
-        // Send via Evolution API
-        $evolution = new EvolutionAPI();
-        $result = $evolution->sendTextMessage($instance, $contact['whatsapp'], $finalMessage);
-
-        if ($result['success']) {
-            $logId = $dispatchLog->logDispatch(
-                $this->userId(),
-                $contactId,
-                $messageId ?: null,
-                $template,
-                $finalMessage,
-                'sent',
-                null
-            );
-
-            $this->json([
-                'success' => true,
-                'message' => $finalMessage,
-                'contact' => $contact['name'] ?? $contact['whatsapp'],
-                'log_id' => $logId,
-            ]);
-        } else {
-            $error = $result['error'] ?? ($result['data']['message'] ?? 'Erro desconhecido');
+        if ($credentials['connection_status'] !== 'active') {
             $logId = $dispatchLog->logDispatch(
                 $this->userId(),
                 $contactId,
@@ -212,12 +194,84 @@ class DispatchController extends Controller
                 $template,
                 $finalMessage,
                 'failed',
-                $error
+                'Conexão WhatsApp inativa. Re-teste em Configurações.'
             );
 
             $this->json([
                 'success' => false,
-                'error' => $error,
+                'error' => 'Sua conexão WhatsApp está inativa. Vá em Configurações e teste novamente.',
+                'message' => $finalMessage,
+                'log_id' => $logId,
+            ]);
+            return;
+        }
+
+        // Send via Evolution API with USER's credentials
+        try {
+            $evolution = new EvolutionAPI($credentials['base_url'], $credentials['token']);
+            $result = $evolution->sendTextMessage($credentials['instance_name'], $contact['whatsapp'], $finalMessage);
+
+            if ($result['success']) {
+                $logId = $dispatchLog->logDispatch(
+                    $this->userId(),
+                    $contactId,
+                    $messageId ?: null,
+                    $template,
+                    $finalMessage,
+                    'sent',
+                    null
+                );
+
+                $this->json([
+                    'success' => true,
+                    'message' => $finalMessage,
+                    'contact' => $contact['name'] ?? $contact['whatsapp'],
+                    'log_id' => $logId,
+                ]);
+            } else {
+                $httpCode = $result['http_code'] ?? 0;
+                $error = $result['error'] ?? ($result['data']['message'] ?? 'Erro desconhecido');
+
+                // If auth failure or not found, mark connection as inactive
+                if (in_array($httpCode, [401, 403, 404])) {
+                    $userModel->updateConnectionStatus($this->userId(), 'inactive');
+                    $error .= ' — Conexão marcada como inativa. Revise suas credenciais em Configurações.';
+                }
+
+                $logId = $dispatchLog->logDispatch(
+                    $this->userId(),
+                    $contactId,
+                    $messageId ?: null,
+                    $template,
+                    $finalMessage,
+                    'failed',
+                    "HTTP {$httpCode}: {$error}"
+                );
+
+                $this->json([
+                    'success' => false,
+                    'error' => $error,
+                    'message' => $finalMessage,
+                    'log_id' => $logId,
+                ]);
+            }
+        } catch (\Exception $e) {
+            // Unexpected error — mark inactive and log
+            $userModel->updateConnectionStatus($this->userId(), 'inactive');
+
+            $logId = $dispatchLog->logDispatch(
+                $this->userId(),
+                $contactId,
+                $messageId ?: null,
+                $template,
+                $finalMessage,
+                'failed',
+                'Exceção: ' . $e->getMessage()
+            );
+
+            $this->json([
+                'success' => false,
+                'error' => 'Erro inesperado ao enviar mensagem. Conexão marcada como inativa.',
                 'message' => $finalMessage,
                 'log_id' => $logId,
             ]);

@@ -16,6 +16,10 @@ CREATE TABLE IF NOT EXISTS users (
     email VARCHAR(255) NOT NULL UNIQUE,
     password_hash VARCHAR(255) NOT NULL,
     evolution_instance VARCHAR(255) DEFAULT NULL,
+    evolution_base_url VARCHAR(500) DEFAULT NULL,
+    evolution_instance_name VARCHAR(255) DEFAULT NULL,
+    evolution_token TEXT DEFAULT NULL,
+    evolution_connection_status ENUM('active','inactive','unconfigured') DEFAULT 'unconfigured',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;

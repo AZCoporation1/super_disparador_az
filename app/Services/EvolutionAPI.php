@@ -4,16 +4,22 @@ namespace App\Services;
 /**
  * Evolution API Integration Service
  * Handles WhatsApp message sending via Evolution API
+ *
+ * Supports DYNAMIC per-user credentials or falls back to global CONFIG.
  */
 class EvolutionAPI
 {
     private string $baseUrl;
     private string $apiToken;
 
-    public function __construct()
+    /**
+     * @param string|null $baseUrl  Per-user base URL (optional, falls back to CONFIG)
+     * @param string|null $apiToken Per-user API token (optional, falls back to CONFIG)
+     */
+    public function __construct(?string $baseUrl = null, ?string $apiToken = null)
     {
-        $this->baseUrl = rtrim(CONFIG['evolution']['url'] ?? '', '/');
-        $this->apiToken = CONFIG['evolution']['token'] ?? '';
+        $this->baseUrl = rtrim($baseUrl ?? (CONFIG['evolution']['url'] ?? ''), '/');
+        $this->apiToken = $apiToken ?? (CONFIG['evolution']['token'] ?? '');
     }
 
     /**
@@ -35,11 +41,44 @@ class EvolutionAPI
 
     /**
      * Check instance connection status
+     * Returns whether the instance state is "open" (connected)
      */
     public function checkConnection(string $instance): array
     {
         $endpoint = "{$this->baseUrl}/instance/connectionState/{$instance}";
-        return $this->request('GET', $endpoint);
+        $result = $this->request('GET', $endpoint);
+
+        if (!$result['success']) {
+            // Map specific HTTP codes to user-friendly messages
+            $httpCode = $result['http_code'] ?? 0;
+            $errorMsg = $result['error'] ?? '';
+
+            if ($httpCode === 401) {
+                $errorMsg = 'Token (API Key) inválido. Verifique suas credenciais.';
+            } elseif ($httpCode === 404) {
+                $errorMsg = 'Instância não encontrada. Verifique o nome da instância.';
+            } elseif ($httpCode === 0) {
+                $errorMsg = 'Não foi possível conectar à URL informada. Verifique a URL base.';
+            }
+
+            return [
+                'success' => false,
+                'error' => $errorMsg,
+                'http_code' => $httpCode,
+            ];
+        }
+
+        // Check if instance state is "open"
+        $state = $result['data']['instance']['state'] ?? ($result['data']['state'] ?? '');
+        $isOpen = strtolower($state) === 'open';
+
+        return [
+            'success' => $isOpen,
+            'state' => $state,
+            'error' => $isOpen ? null : "Instância não está conectada (status: {$state}). Escaneie o QR Code no painel da Evolution API.",
+            'http_code' => $result['http_code'],
+            'data' => $result['data'],
+        ];
     }
 
     /**
@@ -94,45 +133,53 @@ class EvolutionAPI
      */
     private function request(string $method, string $url, ?array $data = null): array
     {
-        $ch = curl_init();
+        try {
+            $ch = curl_init();
 
-        $headers = [
-            'Content-Type: application/json',
-            'Accept: application/json',
-        ];
+            $headers = [
+                'Content-Type: application/json',
+                'Accept: application/json',
+            ];
 
-        if (!empty($this->apiToken)) {
-            $headers[] = "apikey: {$this->apiToken}";
+            if (!empty($this->apiToken)) {
+                $headers[] = "apikey: {$this->apiToken}";
+            }
+
+            curl_setopt_array($ch, [
+                CURLOPT_URL => $url,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT => 30,
+                CURLOPT_HTTPHEADER => $headers,
+                CURLOPT_SSL_VERIFYPEER => false,
+            ]);
+
+            if ($method === 'POST' && $data !== null) {
+                curl_setopt($ch, CURLOPT_POST, true);
+                curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+            }
+
+            $response = curl_exec($ch);
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $error = curl_error($ch);
+            curl_close($ch);
+
+            if ($error) {
+                return ['success' => false, 'error' => "Erro de conexão: {$error}", 'http_code' => 0];
+            }
+
+            $decoded = json_decode($response, true) ?? [];
+
+            return [
+                'success' => $httpCode >= 200 && $httpCode < 300,
+                'http_code' => $httpCode,
+                'data' => $decoded,
+            ];
+        } catch (\Exception $e) {
+            return [
+                'success' => false,
+                'error' => "Exceção: {$e->getMessage()}",
+                'http_code' => 0,
+            ];
         }
-
-        curl_setopt_array($ch, [
-            CURLOPT_URL => $url,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => 30,
-            CURLOPT_HTTPHEADER => $headers,
-            CURLOPT_SSL_VERIFYPEER => false,
-        ]);
-
-        if ($method === 'POST' && $data !== null) {
-            curl_setopt($ch, CURLOPT_POST, true);
-            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
-        }
-
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $error = curl_error($ch);
-        curl_close($ch);
-
-        if ($error) {
-            return ['success' => false, 'error' => "cURL Error: {$error}", 'http_code' => 0];
-        }
-
-        $decoded = json_decode($response, true) ?? [];
-
-        return [
-            'success' => $httpCode >= 200 && $httpCode < 300,
-            'http_code' => $httpCode,
-            'data' => $decoded,
-        ];
     }
 }
